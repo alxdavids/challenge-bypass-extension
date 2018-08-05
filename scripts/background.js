@@ -11,10 +11,8 @@
 /* exported clearStorage */
 /* exported ACTIVE_CONFIG */
 "use strict";
-
-const STORAGE_KEY_TOKENS = "cf-bypass-tokens";
-const STORAGE_KEY_COUNT  = "cf-token-count";
 /* Config variables that are reset in setConfig() depending on the header value that is received (see config.js) */
+let CONFIG_ID = ACTIVE_CONFIG["id"];
 let CHL_CLEARANCE_COOKIE = ACTIVE_CONFIG["cookies"]["clearance-cookie"];
 let CHL_CAPTCHA_DOMAIN = ACTIVE_CONFIG["captcha-domain"]; // cookies have dots prepended
 let CHL_VERIFICATION_ERROR = ACTIVE_CONFIG["error-codes"]["connection-error"];
@@ -24,10 +22,17 @@ let MAX_TOKENS = ACTIVE_CONFIG["max-tokens"];
 let DO_SIGN = ACTIVE_CONFIG["sign"];
 let DO_REDEEM = ACTIVE_CONFIG["redeem"];
 let RELOAD_ON_SIGN = ACTIVE_CONFIG["sign-reload"];
-let REDEEM_ACTION = ACTIVE_CONFIG["spend-action"]["after-redeem"];
+let SIGN_URLS = ACTIVE_CONFIG["sign-url"];
+let SIGN_RESPONSE_FMT = ACTIVE_CONFIG["sign-resp-format"];
+let STORAGE_KEY_TOKENS = ACTIVE_CONFIG["storage-key-tokens"];
+let STORAGE_KEY_COUNT = ACTIVE_CONFIG["storage-key-count"];
+let REDEEM_METHOD = ACTIVE_CONFIG["spend-action"]["redeem-method"];
+let SUBREQ_URL = ACTIVE_CONFIG["spend-action"]["subrequest-url"];
+let HEADER_NAME = ACTIVE_CONFIG["spend-action"]["header-name"];
 let LISTENER_URLS = ACTIVE_CONFIG["spend-action"]["urls"];
 let TOKENS_PER_REQUEST = ACTIVE_CONFIG["tokens-per-request"];
-let SPEND_STATUS_CODE = ACTIVE_CONFIG["spend-status-code"];
+let SPEND_STATUS_CODE = ACTIVE_CONFIG["spending-restrictions"]["status-code"];
+let SPEND_IFRAME = ACTIVE_CONFIG["spending-restrictions"]["iframe"];
 let CHECK_COOKIES = ACTIVE_CONFIG["cookies"]["check-cookies"];
 let MAX_REDIRECT = ACTIVE_CONFIG["spending-restrictions"]["max-redirects"];
 let NEW_TABS = ACTIVE_CONFIG["spending-restrictions"]["new-tabs"];
@@ -152,9 +157,19 @@ function processHeaders(details) {
             }
         }
 
-        // 403 with the right header indicates a bypassable CAPTCHA
+        // correct status code with the right header indicates a bypassable Cloudflare CAPTCHA
         if (isBypassHeader(header) && SPEND_STATUS_CODE.indexOf(details.statusCode) > -1 && DO_REDEEM) {
-            doRedeem = true;
+            let iframe = (details.frameId > 0);
+            // check if the token should only be spent on an iframe
+            if (SPEND_IFRAME) {
+                if (!iframe) {
+                    doRedeem = false;
+                } else {
+                    doRedeem = true;
+                }
+            } else {
+                doRedeem = true;
+            }
         }
     }
 
@@ -205,17 +220,52 @@ function attemptRedeem(url, respTabId) {
 
             // If a clearance cookie is not held then set the spend flag
             if (!clearanceHeld) {
-                setSpendFlag(url.host, true);
-                let targetUrl = target[respTabId];
-                if (url.href == targetUrl) {
-                    chrome.tabs.update(respTabId, { url: targetUrl });
-                } else if (!targetUrl || (targetUrl != url.href && !isFaviconUrl(targetUrl))) {
-                    // set a reload in the future when the target has been inited
-                    futureReload[respTabId] = url.href;
-                }
+                fireRedeem(url, respTabId);
             }
         });
+    } else {
+        fireRedeem(url, respTabId);
     }
+}
+
+function fireRedeem(url, respTabId) {
+    if (REDEEM_METHOD == "reload") {
+        setSpendFlag(url.host, true);
+        let targetUrl = target[respTabId];
+        if (url.href == targetUrl) {
+            chrome.tabs.update(respTabId, { url: targetUrl });
+        } else if (!targetUrl || (targetUrl != url.href && !isFaviconUrl(targetUrl))) {
+            // set a reload in the future when the target has been inited
+            futureReload[respTabId] = url.href;
+        }
+    } else if (REDEEM_METHOD == "subrequest") {
+        subreqRedeem();
+    }
+}
+
+// Redeem tokens via a subrequest instead.
+function subreqRedeem() {
+    let xhr = new XMLHttpRequest();
+    xhr.onreadystatechange = function() {
+        // Respond apprpriately to subrequest xhr
+    };
+
+    const tokenToSpend = GetTokenForSpend();
+    if (tokenToSpend == null) {
+        throw new Error("[privacy-pass]: No token to spend.")
+    }
+
+    const subreqUrl = new URL(SUBREQ_URL);
+    const method = "POST";
+    const http_path = method + " " + subreqUrl.href;
+    const redemptionString = BuildRedeemHeader(tokenToSpend, subreqUrl.hostname, http_path);
+    xhr.open("POST", SUBREQ_URL, true);
+    xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+    xhr.setRequestHeader(HEADER_NAME, redemptionString);
+    // We seem to get back some odd mime types that cause problems...
+    xhr.overrideMimeType("text/plain");
+
+    xhr.send();
 }
 
 // Intercepts token-spend reload requests to add a redemption header.
@@ -230,17 +280,12 @@ function beforeSendHeaders(request) {
     let headers = request.requestHeaders;
 
     // Cancel if we don't have a token to spend or config says no redeem
-    if (!DO_REDEEM || !getSpendFlag(url.host) || checkMaxSpend(url.host) || spentUrl[url.href] || isErrorPage(url.href) || isFaviconUrl(url.href)) {
+    if (!DO_REDEEM || !getSpendFlag(url.host) || checkMaxSpend(url.host) || spentUrl[url.href] || isErrorPage(url.href) || isFaviconUrl(url.href) || REDEEM_METHOD != "reload") {
         return {cancel: false};
     }
 
-    if (REDEEM_ACTION == "reload") {
-        headers = getReloadHeaders(url, headers, request);
-        return {requestHeaders: headers};
-    } else if (REDEEM_ACTION == "subrequest") {
-        // Do something else here to launch a subrequest
-        return {cancel: false};
-    }
+    headers = getReloadHeaders(url, headers, request);
+    return {requestHeaders: headers};
 }
 
 function getReloadHeaders(url,headers,request) {
@@ -257,7 +302,7 @@ function getReloadHeaders(url,headers,request) {
     const method = request.method;
     const http_path = method + " " + url.pathname;
     const redemptionString = BuildRedeemHeader(tokenToSpend, url.hostname, http_path);
-    const newHeader = { name: "challenge-bypass-token", value: redemptionString };
+    const newHeader = { name: HEADER_NAME, value: redemptionString };
     headers.push(newHeader);
     spendId[request.requestId] = true;
     spentUrl[url.href] = true;
@@ -273,7 +318,7 @@ function getReloadHeaders(url,headers,request) {
 chrome.webRequest.onBeforeRequest.addListener(
     beforeRequest,            // callback
     { urls: [LISTENER_URLS] }, // targeted pages
-    ["blocking"]              // desired traits
+    ["blocking", "requestBody"] // desired traits
 );
 
 // This function filters requests before we've made a connection. If we don't
@@ -289,6 +334,55 @@ function beforeRequest(details) {
         resetVars();
     }
 
+    // Different signing methods based on configs
+    let xhrInfo;
+    switch (CONFIG_ID) {
+        case 1:
+            xhrInfo = signReqCF(details);
+            break;
+        case 2:
+            xhrInfo = signReqFC(details);
+            break;
+        default:
+            return {cancel: false};
+    }
+
+    // If this is null then signing is not appropriate
+    if (xhrInfo == null) {
+        return {cancel: false};
+    }
+
+    // actually send the token signing request via xhr
+    xhrSignRequest(xhrInfo, details.url, details.tabId);
+
+    // Cancel the original request
+    return {cancel: false};
+}
+
+// Spending for FunCaptcha
+function signReqFC(details) {
+    let reqUrl = details.url;
+    for (let i=0;i<SIGN_URLS.length;i++) {
+        if (reqUrl == SIGN_URLS[i] && !sentTokens[reqUrl]) {
+            let tokens = GenerateNewTokens(TOKENS_PER_REQUEST);
+            const request = BuildIssueRequest(tokens);
+            let originalForm = details.requestBody["formData"];
+            if (originalForm == null) {
+                continue;
+            } else {
+                let data = xhrDataSerialise(originalForm);
+                data += "blinded-tokens=" + request;
+                let newUrl = markSignUrl(reqUrl);
+                sentTokens[reqUrl] = true;
+                return {newUrl: newUrl, requestBody: data, tokens: tokens};
+            }
+        }
+    }
+    return null;
+}
+
+// Spending on Cloudflare captchas requires an XHR request
+function signReqCF(details) {
     let reqUrl = details.url;
     const manualChallenge = reqUrl.indexOf("manual_challenge") != -1;
     const captchaResp = reqUrl.indexOf("g-recaptcha-response") != -1;
@@ -296,14 +390,25 @@ function beforeRequest(details) {
 
     // We're only interested in CAPTCHA solution requests that we haven't already altered.
     if ((captchaResp && alreadyProcessed) || (!manualChallenge && !captchaResp) || sentTokens[reqUrl]) {
-        return {cancel: false};
+        return null;
     }
     sentTokens[reqUrl] = true;
     let tokens = GenerateNewTokens(TOKENS_PER_REQUEST);
     const request = BuildIssueRequest(tokens);
 
     // Tag the URL of the new request to prevent an infinite loop (see above)
-    let newUrl = reqUrl + "&captcha-bypass=true";
+    let newUrl = markSignUrl(reqUrl);
+    // Construct info for xhr signing request
+    let xhrInfo = {newUrl: newUrl, requestBody: "blinded-tokens=" + request, tokens: tokens};
+
+    return xhrInfo;
+}
+
+// Send tokens for signing an dprocess response
+function xhrSignRequest(xhrInfo, reqUrl, tabId) {
+    let newUrl = xhrInfo["newUrl"];
+    let requestBody = xhrInfo["requestBody"];
+    let tokens = xhrInfo["tokens"];
 
     let xhr = new XMLHttpRequest();
     xhr.onreadystatechange = function() {
@@ -322,7 +427,7 @@ function beforeRequest(details) {
                     let pathIndex = url.href.indexOf(captchaPath);
                     let reloadUrl = url.href.substring(0, pathIndex+1);
                     setSpendFlag(reloadUrl, true);
-                    chrome.tabs.update(details.tabId, { url: reloadUrl });
+                    chrome.tabs.update(tabId, { url: reloadUrl });
                 }
             }
         } else if (countStoredTokens() >= (MAX_TOKENS - TOKENS_PER_REQUEST)) {
@@ -336,10 +441,7 @@ function beforeRequest(details) {
     // We seem to get back some odd mime types that cause problems...
     xhr.overrideMimeType("text/plain");
 
-    xhr.send("blinded-tokens=" + request);
-
-    // Cancel the original request
-    return {redirectUrl: "javascript:void(0)"};
+    xhr.send(requestBody);
 }
 
 // Removes cookies for captcha.website to enable getting more tokens
@@ -372,12 +474,23 @@ chrome.windows.onRemoved.addListener(function() {
 //
 // If the blinded points are P = H(t)rB, these are Q = kP.
 function parseIssueResponse(data, tokens) {
-    const split = data.split("signatures=", 2);
-    if (split.length != 2) {
+    let signaturesJSON;
+    switch (SIGN_RESPONSE_FMT) {
+        case "string":
+            signaturesJSON = parseSigString(data);
+            break;
+        case "json":
+            signaturesJSON = parseSigJson(data);
+            break;
+        default:
+            throw new Error("[privacy-pass]: invalid signature response format " + SIGN_RESPONSE_FMT);
+    }
+
+    if (signaturesJSON == null) {
         throw new Error("[privacy-pass]: signature response invalid or in unexpected format, got response: " + data);
     }
+
     // decodes base-64
-    const signaturesJSON = atob(split[1]);
     // parses into JSON
     const issueResp = JSON.parse(signaturesJSON);
     let batchProof = issueResp[issueResp.length - 1];
@@ -401,6 +514,19 @@ function parseIssueResponse(data, tokens) {
     }
 
     return usablePoints;
+}
+
+function parseSigJson(data) {
+    let json = JSON.parse(data)
+    return json["signatures"];
+}
+
+function parseSigString(data) {
+    let split = data.split("signatures=", 2);
+    if (split.length != 2) {
+        return null;
+    }
+    return atob(split[1]);
 }
 
 // Set the target URL for the spend and update the tab if necessary
@@ -561,6 +687,21 @@ function getSpendFlag(key) {
 var UpdateCallback = function() { }
 
 /* Utility functions */
+
+// serialise array data so that it can be sent in an xhr post request
+function xhrDataSerialise(arr) {
+    let str = "";
+    for (var key in arr) {
+        let val = arr[key];
+        str += key + "=";
+        for (let i=0;i<val.length;i++) {
+            str += encodeURIComponent(val[i]);
+        }
+        str += "&";
+    }
+    return str;
+}
+
 function reloadTab(cookieDomain) {
     let found = false;
     chrome.windows.getAll(function(windows) {
@@ -639,6 +780,11 @@ function badTransition(href, type, transitionType) {
     return BAD_TRANSITION.indexOf(type) > -1;
 }
 
+// Mark the url so tha ta sign doesn't occur again.
+function markSignUrl(url) {
+    return url + "&captcha-bypass=true"
+}
+
 function isNewTab(url) {
     for (let i=0; i<NEW_TABS.length; i++) {
         if (url.indexOf(NEW_TABS[i]) > -1) {
@@ -687,6 +833,7 @@ function isBypassHeader(header) {
 
 function setConfig(val) {
     ACTIVE_CONFIG = PPConfigs[val]
+    CONFIG_ID = ACTIVE_CONFIG["id"];
     CHL_CLEARANCE_COOKIE = ACTIVE_CONFIG["cookies"]["clearance-cookie"];
     CHL_CAPTCHA_DOMAIN = ACTIVE_CONFIG["captcha-domain"]; // cookies have dots prepended
     CHL_VERIFICATION_ERROR = ACTIVE_CONFIG["error-codes"]["connection-error"];
@@ -696,10 +843,17 @@ function setConfig(val) {
     DO_SIGN = ACTIVE_CONFIG["sign"];
     DO_REDEEM = ACTIVE_CONFIG["redeem"];
     RELOAD_ON_SIGN = ACTIVE_CONFIG["sign-reload"];
-    REDEEM_ACTION = ACTIVE_CONFIG["spend-action"]["after-redeem"];
-    LISTENER_URLS = ACTIVE_CONFIG["spend-action"]["urls"]
+    SIGN_URLS = ACTIVE_CONFIG["sign-url"];
+    SIGN_RESPONSE_FMT = ACTIVE_CONFIG["sign-resp-format"];
+    STORAGE_KEY_TOKENS = ACTIVE_CONFIG["storage-key-tokens"];
+    STORAGE_KEY_COUNT = ACTIVE_CONFIG["storage-key-count"];
+    REDEEM_METHOD = ACTIVE_CONFIG["spend-action"]["redeem-method"];
+    SUBREQ_URL = ACTIVE_CONFIG["spend-action"]["subrequest-url"];
+    LISTENER_URLS = ACTIVE_CONFIG["spend-action"]["urls"];
+    HEADER_NAME = ACTIVE_CONFIG["spend-action"]["header-name"];
     TOKENS_PER_REQUEST = ACTIVE_CONFIG["tokens-per-request"];
-    SPEND_STATUS_CODE = ACTIVE_CONFIG["spend-status-code"];
+    SPEND_STATUS_CODE = ACTIVE_CONFIG["spending-restrictions"]["status-code"];
+    SPEND_IFRAME = ACTIVE_CONFIG["spending-restrictions"]["iframe"];
     CHECK_COOKIES = ACTIVE_CONFIG["cookies"]["check-cookies"];
     MAX_REDIRECT = ACTIVE_CONFIG["spending-restrictions"]["max-redirects"];
     NEW_TABS = ACTIVE_CONFIG["spending-restrictions"]["new-tabs"];
@@ -710,4 +864,5 @@ function setConfig(val) {
     VAR_RESET = ACTIVE_CONFIG["var-reset"];
     VAR_RESET_MS = ACTIVE_CONFIG["var-reset-ms"];
     setActiveCommitments();
+    countStoredTokens();
 }

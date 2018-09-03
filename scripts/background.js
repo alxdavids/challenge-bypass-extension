@@ -359,7 +359,7 @@ function beforeRequest(details) {
     return {cancel: false};
 }
 
-// Spending for FunCaptcha
+// Sending tokens to be signed for FunCaptcha
 function signReqFC(details) {
     let reqUrl = details.url;
     for (let i=0;i<SIGN_URLS.length;i++) {
@@ -381,7 +381,7 @@ function signReqFC(details) {
     return null;
 }
 
-// Spending on Cloudflare captchas requires an XHR request
+// Sending tokens to be signed for Cloudflare
 function signReqCF(details) {
     let reqUrl = details.url;
     const manualChallenge = reqUrl.indexOf("manual_challenge") != -1;

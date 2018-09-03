@@ -154,7 +154,7 @@ const fcConfig = {
 	},
 	"spend-action": {
 		"urls": "<all_urls>",
-		"redeem-method": "reload",
+		"redeem-method": "subrequest",
 		"header-name": "challenge-bypass-token",
 		"subrequest-url": "https://funcaptcha.com/fc/ca/",
 	},
